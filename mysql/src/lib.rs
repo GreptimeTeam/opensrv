@@ -512,7 +512,9 @@ where
 
                 // auth switch
                 if !auth_plugin_expect.is_empty()
-                    && auth_response.is_empty()
+                    && handshake
+                        .capabilities
+                        .contains(CapabilityFlags::CLIENT_PLUGIN_AUTH)
                     && handshake.auth_plugin != auth_plugin_expect.as_bytes()
                 {
                     self.writer.set_seq(seq + 1);

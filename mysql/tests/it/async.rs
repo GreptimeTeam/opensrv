@@ -28,9 +28,9 @@ use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ErrorKind, InitWriter, OkResponse, ParamParser,
     QueryResultWriter, StatementMetaWriter, U24_MAX,
 };
-use tokio::io::BufWriter;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 struct TestingShim<Q, P, E> {
     columns: Vec<Column>,
@@ -38,6 +38,7 @@ struct TestingShim<Q, P, E> {
     on_q: Q,
     on_p: P,
     on_e: E,
+    auth: Option<(&'static [u8], &'static str, &'static [u8])>,
 }
 
 #[async_trait]
@@ -63,6 +64,29 @@ where
             -> Pin<Box<dyn std::future::Future<Output = Result<(), std::io::Error>> + Send + 's>>,
 {
     type Error = io::Error;
+
+    async fn auth_plugin_for_username(&self, user: &[u8]) -> &'static str {
+        self.auth
+            .map_or("mysql_native_password", |(expected_user, plugin, _)| {
+                assert_eq!(expected_user, user);
+                plugin
+            })
+    }
+
+    async fn authenticate(
+        &self,
+        auth_plugin: &str,
+        username: &[u8],
+        _salt: &[u8],
+        auth_data: &[u8],
+    ) -> bool {
+        self.auth
+            .is_none_or(|(expected_user, expected_plugin, expected_data)| {
+                username == expected_user
+                    && auth_plugin == expected_plugin
+                    && auth_data == expected_data
+            })
+    }
 
     async fn on_prepare<'a>(
         &'a mut self,
@@ -167,7 +191,18 @@ where
             on_q,
             on_p,
             on_e,
+            auth: None,
         }
+    }
+
+    fn with_auth(
+        mut self,
+        username: &'static [u8],
+        plugin: &'static str,
+        auth_data: &'static [u8],
+    ) -> Self {
+        self.auth = Some((username, plugin, auth_data));
+        self
     }
 
     fn with_params(mut self, p: Vec<Column>) -> Self {
@@ -228,6 +263,78 @@ async fn it_connects() {
     )
     .test(|_| async { Ok(()) })
     .await;
+}
+
+#[tokio::test]
+async fn switches_auth_plugin_after_nonempty_response() {
+    TestingShim::new(
+        |_, _| unreachable!(),
+        |_| unreachable!(),
+        |_, _, _| unreachable!(),
+    )
+    .with_auth(b"*", "mysql_clear_password", b"signed-token\0")
+    .test_with_opts(
+        |port| {
+            Opts::from_url(&format!(
+                "mysql://%2A:signed-token@127.0.0.1:{port}?enable_cleartext_plugin=true"
+            ))
+            .unwrap()
+        },
+        |_| async { Ok(()) },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn does_not_switch_auth_plugin_without_client_capability() {
+    async fn read_packet(client: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0; 4];
+        client.read_exact(&mut header).await.unwrap();
+        let packet_len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+        let mut packet = vec![0; packet_len];
+        client.read_exact(&mut packet).await.unwrap();
+        packet
+    }
+
+    let shim = TestingShim::new(
+        |_, _| unreachable!(),
+        |_| unreachable!(),
+        |_, _, _| unreachable!(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (r, w) = socket.into_split();
+        AsyncMysqlIntermediary::run_on(shim, r, BufWriter::new(w)).await
+    });
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    read_packet(&mut client).await;
+
+    let capabilities = (myc::constants::CapabilityFlags::CLIENT_PROTOCOL_41
+        | myc::constants::CapabilityFlags::CLIENT_SECURE_CONNECTION)
+        .bits();
+    let mut response = Vec::new();
+    response.extend_from_slice(&capabilities.to_le_bytes());
+    response.extend_from_slice(&0_u32.to_le_bytes());
+    response.push(0x21);
+    response.extend_from_slice(&[0; 23]);
+    response.extend_from_slice(b"legacy\0");
+    response.push(20);
+    response.extend_from_slice(&[1; 20]);
+
+    let packet_len = u32::try_from(response.len()).unwrap().to_le_bytes();
+    client.write_all(&packet_len[..3]).await.unwrap();
+    client.write_all(&[1]).await.unwrap();
+    client.write_all(&response).await.unwrap();
+
+    let response = read_packet(&mut client).await;
+    assert_eq!(0x00, response[0], "client received an auth switch packet");
+
+    drop(client);
+    server.await.unwrap().unwrap();
 }
 
 #[tokio::test]
