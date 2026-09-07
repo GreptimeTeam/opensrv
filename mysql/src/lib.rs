@@ -160,6 +160,23 @@ pub trait AsyncMysqlShim<W: Send> {
         true
     }
 
+    /// Authenticates using the initial database from the client handshake.
+    ///
+    /// Called after TLS negotiation and any authentication plugin switch, before
+    /// `on_init`. The database is absent when the client did not select one.
+    /// The default delegates to `authenticate` for database-independent backends.
+    async fn authenticate_with_database(
+        &self,
+        auth_plugin: &str,
+        username: &[u8],
+        salt: &[u8],
+        auth_data: &[u8],
+        _database: Option<&[u8]>,
+    ) -> bool {
+        self.authenticate(auth_plugin, username, salt, auth_data)
+            .await
+    }
+
     /// Called when the client issues a request to prepare `query` for later execution.
     ///
     /// The provided [`StatementMetaWriter`](struct.StatementMetaWriter.html) should be used to
@@ -545,11 +562,12 @@ where
 
                 if !self
                     .shim
-                    .authenticate(
+                    .authenticate_with_database(
                         auth_plugin_expect,
                         username,
                         &scramble,
                         auth_response.as_slice(),
+                        handshake.db.as_deref(),
                     )
                     .await
                 {
